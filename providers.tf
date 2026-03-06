@@ -1,14 +1,10 @@
 terraform {
   required_version = ">= 1.0.0"
 
-  backend "s3" {
-    # TO DO: Ajustar os valores com as informações reais da conta (Bucket, Lock Table, etc)
-    bucket         = "meu-bucket-terraform-state"
-    key            = "ecs-service/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    dynamodb_table = "terraform-state-lock"
-  }
+  # O backend é configurado dinamicamente via arquivo HCL externo:
+  #   terraform init -backend-config="envs/backend-<env>.hcl"
+  # Isso permite um state isolado por ambiente sem alterar código.
+  backend "s3" {}
 
   required_providers {
     aws = {
@@ -20,7 +16,7 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
-  
+
   default_tags {
     tags = {
       Environment = var.environment
@@ -29,3 +25,4 @@ provider "aws" {
     }
   }
 }
+

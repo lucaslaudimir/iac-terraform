@@ -1,0 +1,173 @@
+name: Terraform - ECS Service Deploy
+
+on:
+  push:
+    branches:
+      - main          # PRD
+      - hml           # HML
+      - uat           # UAT
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente alvo"
+        required: true
+        type: choice
+        options: [hml, uat, prd]
+      action:
+        description: "Ação Terraform"
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+# Evita execuções paralelas no mesmo ambiente
+concurrency:
+  group: terraform-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION: "us-east-1"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Determina qual ambiente será usado baseado na branch ou input
+  # ──────────────────────────────────────────────────────────────
+  setup:
+    name: Detectar Ambiente
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      action: ${{ steps.env.outputs.action }}
+    steps:
+      - name: Resolver ambiente e ação
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+            ACTION="${{ github.event.inputs.action }}"
+          else
+            case "${{ github.ref_name }}" in
+              main) ENV="prd"  ;;
+              hml)  ENV="hml"  ;;
+              uat)  ENV="uat"  ;;
+              *)
+                echo "Branch ${{ github.ref_name }} não mapeada para nenhum ambiente."
+                exit 1
+                ;;
+            esac
+            ACTION="apply"
+          fi
+          echo "environment=$ENV"   >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION"     >> "$GITHUB_OUTPUT"
+          echo "🎯 Ambiente: $ENV | Ação: $ACTION"
+
+  # ──────────────────────────────────────────────────────────────
+  # Terraform: init + plan
+  # ──────────────────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan (${{ needs.setup.outputs.environment }})
+    runs-on: ubuntu-latest
+    needs: setup
+    environment: ${{ needs.setup.outputs.environment }}   # Usa os Secrets do Environment do GitHub
+    permissions:
+      id-token: write   # Necessário para OIDC
+      contents: read
+
+    env:
+      ENV: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="envs/backend-${{ env.ENV }}.hcl" \
+            -reconfigure
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="envs/${{ env.ENV }}.tfvars" \
+            -out=tfplan \
+            -detailed-exitcode
+        continue-on-error: true
+
+      - name: Verificar resultado do Plan
+        run: |
+          EXIT_CODE=${{ steps.plan.outcome == 'success' && '0' || '1' }}
+          # exit code 2 = mudanças detectadas (não é erro)
+          if [ "${{ steps.plan.outputs.exitcode }}" = "1" ]; then
+            echo "❌ Terraform plan falhou com erro."
+            exit 1
+          fi
+
+      - name: Salvar plano como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.ENV }}-${{ github.run_id }}
+          path: tfplan
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────
+  # Terraform: apply (apenas se a ação for apply)
+  # PRD requer aprovação manual via GitHub Environment protection rules
+  # ──────────────────────────────────────────────────────────────
+  terraform-apply:
+    name: Terraform Apply (${{ needs.setup.outputs.environment }})
+    runs-on: ubuntu-latest
+    needs: [setup, terraform-plan]
+    if: needs.setup.outputs.action == 'apply'
+    environment: ${{ needs.setup.outputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      ENV: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="envs/backend-${{ env.ENV }}.hcl" \
+            -reconfigure
+
+      - name: Baixar plano aprovado
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.ENV }}-${{ github.run_id }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
