@@ -1,90 +1,97 @@
-name: Terraform - ECS Service Deploy
+name: Terraform - ECS Infrastructure
 
 on:
   push:
     branches:
-      - main          # PRD
-      - hml           # HML
-      - uat           # UAT
+      - uat
+      - hml
+      - release
   workflow_dispatch:
     inputs:
-      environment:
-        description: "Ambiente alvo"
-        required: true
-        type: choice
-        options: [hml, uat, prd]
       action:
-        description: "Ação Terraform"
+        description: "Ação Terraform (apply já está implícito no push; use destroy com cautela)"
         required: true
         type: choice
-        options: [plan, apply, destroy]
+        options: [plan, destroy]
         default: plan
 
-# Evita execuções paralelas no mesmo ambiente
+# Evita execuções paralelas no mesmo ambiente (mesma branch)
 concurrency:
   group: terraform-${{ github.ref_name }}
   cancel-in-progress: false
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
+  AWS_REGION: us-east-1
   TF_VERSION: "1.7.5"
-  AWS_REGION: "us-east-1"
+  TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_BACK }}
 
 jobs:
-  # ──────────────────────────────────────────────────────────────
-  # Determina qual ambiente será usado baseado na branch ou input
-  # ──────────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────
+  # Detecta o ambiente com base na branch — igual ao deploy.yml
+  # ────────────────────────────────────────────────────────────
   setup:
     name: Detectar Ambiente
     runs-on: ubuntu-latest
     outputs:
-      environment: ${{ steps.env.outputs.environment }}
-      action: ${{ steps.env.outputs.action }}
+      env_tag:  ${{ steps.detect.outputs.env_tag }}
+      role_arn: ${{ steps.detect.outputs.role_arn }}
+      action:   ${{ steps.detect.outputs.action }}
     steps:
-      - name: Resolver ambiente e ação
-        id: env
+      - name: Detect Environment
+        id: detect
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            ENV="${{ github.event.inputs.environment }}"
-            ACTION="${{ github.event.inputs.action }}"
-          else
-            case "${{ github.ref_name }}" in
-              main) ENV="prd"  ;;
-              hml)  ENV="hml"  ;;
-              uat)  ENV="uat"  ;;
-              *)
-                echo "Branch ${{ github.ref_name }} não mapeada para nenhum ambiente."
-                exit 1
-                ;;
-            esac
-            ACTION="apply"
-          fi
-          echo "environment=$ENV"   >> "$GITHUB_OUTPUT"
-          echo "action=$ACTION"     >> "$GITHUB_OUTPUT"
-          echo "🎯 Ambiente: $ENV | Ação: $ACTION"
+          BRANCH="${GITHUB_REF##*/}"
 
-  # ──────────────────────────────────────────────────────────────
-  # Terraform: init + plan
-  # ──────────────────────────────────────────────────────────────
+          if [ "$BRANCH" = "uat" ]; then
+            echo "env_tag=uat"                            >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_UAT }}" >> $GITHUB_OUTPUT
+
+          elif [ "$BRANCH" = "hml" ]; then
+            echo "env_tag=hml"                            >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_HML }}" >> $GITHUB_OUTPUT
+
+          elif [ "$BRANCH" = "release" ]; then
+            echo "env_tag=prd"                            >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_PRD }}" >> $GITHUB_OUTPUT
+
+          else
+            echo "❌ Branch '$BRANCH' não mapeada para nenhum ambiente."
+            exit 1
+          fi
+
+          # Para workflow_dispatch, respeita o input; nos pushes sempre faz apply
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "action=${{ github.event.inputs.action }}" >> $GITHUB_OUTPUT
+          else
+            echo "action=apply"                             >> $GITHUB_OUTPUT
+          fi
+
+  # ────────────────────────────────────────────────────────────
+  # Terraform Plan
+  # ────────────────────────────────────────────────────────────
   terraform-plan:
-    name: Terraform Plan (${{ needs.setup.outputs.environment }})
+    name: "Terraform Plan (${{ needs.setup.outputs.env_tag }})"
     runs-on: ubuntu-latest
     needs: setup
-    environment: ${{ needs.setup.outputs.environment }}   # Usa os Secrets do Environment do GitHub
-    permissions:
-      id-token: write   # Necessário para OIDC
-      contents: read
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
 
     env:
-      ENV: ${{ needs.setup.outputs.environment }}
+      ENV: ${{ needs.setup.outputs.env_tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar AWS Credentials (OIDC)
+      - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-to-assume: ${{ needs.setup.outputs.role_arn }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
@@ -104,53 +111,56 @@ jobs:
       - name: Terraform Plan
         id: plan
         run: |
+          set +e
           terraform plan \
             -var-file="envs/${{ env.ENV }}.tfvars" \
             -out=tfplan \
             -detailed-exitcode
-        continue-on-error: true
+          EXIT_CODE=$?
+          set -e
 
-      - name: Verificar resultado do Plan
-        run: |
-          EXIT_CODE=${{ steps.plan.outcome == 'success' && '0' || '1' }}
-          # exit code 2 = mudanças detectadas (não é erro)
-          if [ "${{ steps.plan.outputs.exitcode }}" = "1" ]; then
-            echo "❌ Terraform plan falhou com erro."
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "❌ Terraform plan retornou erro."
             exit 1
+          elif [ $EXIT_CODE -eq 2 ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "📋 Mudanças detectadas no plan."
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "✅ Nenhuma mudança detectada."
           fi
 
       - name: Salvar plano como artefato
+        if: steps.plan.outputs.has_changes == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ env.ENV }}-${{ github.run_id }}
           path: tfplan
           retention-days: 7
 
-  # ──────────────────────────────────────────────────────────────
-  # Terraform: apply (apenas se a ação for apply)
-  # PRD requer aprovação manual via GitHub Environment protection rules
-  # ──────────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────
+  # Terraform Apply  (somente em push com mudanças detectadas)
+  # Para PRD (branch release): o próprio time já controla via PR
+  # ────────────────────────────────────────────────────────────
   terraform-apply:
-    name: Terraform Apply (${{ needs.setup.outputs.environment }})
+    name: "Terraform Apply (${{ needs.setup.outputs.env_tag }})"
     runs-on: ubuntu-latest
     needs: [setup, terraform-plan]
-    if: needs.setup.outputs.action == 'apply'
-    environment: ${{ needs.setup.outputs.environment }}
-    permissions:
-      id-token: write
-      contents: read
+    if: |
+      needs.setup.outputs.action == 'apply' &&
+      needs.terraform-plan.outputs.has_changes == 'true'
 
     env:
-      ENV: ${{ needs.setup.outputs.environment }}
+      ENV: ${{ needs.setup.outputs.env_tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar AWS Credentials (OIDC)
+      - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-to-assume: ${{ needs.setup.outputs.role_arn }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
@@ -170,4 +180,79 @@ jobs:
           name: tfplan-${{ env.ENV }}-${{ github.run_id }}
 
       - name: Terraform Apply
+        id: apply
         run: terraform apply -auto-approve tfplan
+
+      - name: Notify failure via Teams
+        if: failure() && env.TEAMS_WEBHOOK != ''
+        run: |
+          jq -n \
+            --arg repo    "$GITHUB_REPOSITORY" \
+            --arg branch  "${GITHUB_REF##*/}" \
+            --arg author  "${{ github.actor }}" \
+            --arg env_tag "${{ env.ENV }}" \
+            --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{
+              "@type":    "MessageCard",
+              "@context": "https://schema.org/extensions",
+              "themeColor": "FF0000",
+              "summary":    "Terraform Apply falhou",
+              "sections": [{
+                "activityTitle":    "❌ Terraform Apply falhou",
+                "activitySubtitle": ("Repositório: " + $repo),
+                "facts": [
+                  {"name": "Ambiente", "value": $env_tag},
+                  {"name": "Branch",   "value": $branch},
+                  {"name": "Autor",    "value": $author}
+                ],
+                "markdown": true
+              }],
+              "potentialAction": [{
+                "@type": "OpenUri",
+                "name":  "Ver detalhes no GitHub Actions",
+                "targets": [{"os": "default", "uri": $run_url}]
+              }]
+            }' > message.json
+
+          curl -s -H "Content-Type: application/json" \
+               -d @message.json \
+               "${{ env.TEAMS_WEBHOOK }}"
+
+  # ────────────────────────────────────────────────────────────
+  # Terraform Destroy (apenas via workflow_dispatch)
+  # ────────────────────────────────────────────────────────────
+  terraform-destroy:
+    name: "Terraform Destroy (${{ needs.setup.outputs.env_tag }}) ⚠️"
+    runs-on: ubuntu-latest
+    needs: [setup, terraform-plan]
+    if: needs.setup.outputs.action == 'destroy'
+
+    env:
+      ENV: ${{ needs.setup.outputs.env_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.setup.outputs.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="envs/backend-${{ env.ENV }}.hcl" \
+            -reconfigure
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy \
+            -var-file="envs/${{ env.ENV }}.tfvars" \
+            -auto-approve

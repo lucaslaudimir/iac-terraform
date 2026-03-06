@@ -1,0 +1,95 @@
+name: SonarQube Analysis
+
+on:
+  pull_request:
+    branches:
+      - uat
+      - hml
+      - release
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  DOMAIN: llz-dev
+  REPOSITORY: llz
+
+jobs:
+  sonar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ACTIONS_ROLE_UAT }}
+          aws-region: us-east-1
+
+      - name: Get CodeArtifact Token
+        id: codeartifact
+        run: |
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain $DOMAIN \
+            --domain-owner ${{ secrets.ACTIONS_DOMAIN_OWNER_UAT }} \
+            --query authorizationToken \
+            --output text)
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Cache Maven and Sonar
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.sonar/cache
+          key: ${{ runner.os }}-m2-sonar-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2-sonar
+
+      - name: Setup Maven & Run Sonar
+        env:
+          AWS_REGION: us-east-1
+          CODE_ARTIFACT_DOMAIN: llz-dev
+          AWS_ACCOUNT_ID: ${{ secrets.ACTIONS_DOMAIN_OWNER_UAT }}
+          CODEARTIFACT_REPO: llz
+          CODEARTIFACT_AUTH_TOKEN: ${{ steps.codeartifact.outputs.token }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          export CODEARTIFACT_URI="https://${CODE_ARTIFACT_DOMAIN}-${AWS_ACCOUNT_ID}.d.codeartifact.${AWS_REGION}.amazonaws.com/maven/${CODEARTIFACT_REPO}/"
+
+          echo "Gerando settings.xml apontando para: ${CODEARTIFACT_URI}"
+
+          cat > settings.xml << EOF
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+            <servers>
+              <server>
+                <id>llz-mirror</id>
+                <username>aws</username>
+                <password>${CODEARTIFACT_AUTH_TOKEN}</password>
+              </server>
+            </servers>
+            <mirrors>
+              <mirror>
+                <id>llz-mirror</id>
+                <url>${CODEARTIFACT_URI}</url>
+                <mirrorOf>*</mirrorOf>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+
+          mvn -s settings.xml -B -T 1C clean verify sonar:sonar \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.projectKey=llzgarantidora_back-cobranca-ativa-service \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}

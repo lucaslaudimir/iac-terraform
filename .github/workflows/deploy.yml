@@ -1,0 +1,509 @@
+name: CI/CD Pipeline - LLZ
+
+on:
+  push:
+    branches:
+      - uat
+      - hml
+      - release
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+env:
+  AWS_REGION: us-east-1
+  APP_REPOSITORY: ${{ github.event.repository.name }}
+  TEAMS_WEBHOOK_BACK: ${{ secrets.TEAMS_WEBHOOK_BACK }}
+  ECS_SERVICE: cobranca-ativa
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+      env-tag: ${{ steps.detect.outputs.env_tag }}
+      deploy-ecs: ${{ steps.detect.outputs.deploy_ecs }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Detect Environment
+        id: detect
+        shell: bash
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+
+            if [ "$BRANCH" = "uat" ]; then
+            echo "env_tag=uat" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=LLZ-UAT" >> $GITHUB_OUTPUT
+            echo "ecs_service=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "container_name=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_UAT }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ACTIONS_ECR_REGISTRY_UAT }}" >> $GITHUB_OUTPUT
+            echo "base_image_repo=${{ secrets.ACTIONS_BASEREPO_UAT }}" >> $GITHUB_OUTPUT
+            echo "deploy_ecs=true" >> $GITHUB_OUTPUT
+            echo "ca_domain=llz-dev" >> $GITHUB_OUTPUT
+            echo "ca_repo=llz" >> $GITHUB_OUTPUT
+            echo "ca_owner=${{ secrets.ACTIONS_DOMAIN_OWNER_UAT }}" >> $GITHUB_OUTPUT
+
+          elif [ "$BRANCH" = "hml" ]; then
+            echo "env_tag=hml" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=LLZ-HML" >> $GITHUB_OUTPUT
+            echo "ecs_service=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "container_name=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_HML }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ACTIONS_ECR_REGISTRY_HML }}" >> $GITHUB_OUTPUT
+            echo "base_image_repo=${{ secrets.ACTIONS_BASEREPO_HML }}" >> $GITHUB_OUTPUT
+            echo "deploy_ecs=true" >> $GITHUB_OUTPUT
+            echo "ca_domain=llz-dev" >> $GITHUB_OUTPUT
+            echo "ca_repo=llz-hml" >> $GITHUB_OUTPUT
+            echo "ca_owner=${{ secrets.ACTIONS_DOMAIN_OWNER_UAT }}" >> $GITHUB_OUTPUT
+
+          elif [ "$BRANCH" = "release" ]; then
+            echo "env_tag=prd" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=LLZ-PRD" >> $GITHUB_OUTPUT
+            echo "ecs_service=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "container_name=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_PRD }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ACTIONS_ECR_REGISTRY_PRD }}" >> $GITHUB_OUTPUT
+            echo "base_image_repo=${{ secrets.ACTIONS_BASEREPO_PRD }}" >> $GITHUB_OUTPUT
+            echo "deploy_ecs=true" >> $GITHUB_OUTPUT
+            echo "ca_domain=llz-dev" >> $GITHUB_OUTPUT
+            echo "ca_repo=llz-prd" >> $GITHUB_OUTPUT
+            echo "ca_owner=${{ secrets.ACTIONS_DOMAIN_OWNER_UAT }}" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_ecs=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.detect.outputs.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.sonar/cache
+          key: ${{ runner.os }}-m2-sonar-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2-sonar
+
+      - name: Configure Maven settings
+        env:
+          AWS_REGION: us-east-1
+          CODE_ARTIFACT_DOMAIN: ${{ steps.detect.outputs.ca_domain }}
+          AWS_ACCOUNT_ID: ${{ steps.detect.outputs.ca_owner }}
+          CODEARTIFACT_REPO: ${{ steps.detect.outputs.ca_repo }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          echo "Configurando Maven para Domain: $CODE_ARTIFACT_DOMAIN, Repo: $CODEARTIFACT_REPO, Owner: $AWS_ACCOUNT_ID"
+          
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain "${CODE_ARTIFACT_DOMAIN}" \
+            --domain-owner "${AWS_ACCOUNT_ID}" \
+            --query authorizationToken --output text)
+          
+          CODEARTIFACT_URI="https://${CODE_ARTIFACT_DOMAIN}-${AWS_ACCOUNT_ID}.d.codeartifact.${AWS_REGION}.amazonaws.com/maven/${CODEARTIFACT_REPO}/"
+          echo "Gerando ~/.m2/settings.xml apontando para: ${CODEARTIFACT_URI}"
+          
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<EOF
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+            <servers>
+              <server>
+                <id>llz-mirror</id>
+                <username>aws</username>
+                <password>${TOKEN}</password>
+              </server>
+            </servers>
+            <mirrors>
+              <mirror>
+                <id>llz-mirror</id>
+                <url>${CODEARTIFACT_URI}</url>
+                <mirrorOf>*</mirrorOf>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+
+      - name: Build Jar
+        run: |
+          mvn -B -s ~/.m2/settings.xml -DskipTests clean package
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        run: |
+          # build-arg BASE_IMAGE_REPO optional; Dockerfile should handle ARG
+          docker build \
+            --build-arg BASE_IMAGE_REPO=${{ steps.detect.outputs.base_image_repo }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPOSITORY }}:latest .
+
+      - name: Tag Docker Image
+        id: tag
+        run: |
+          TAG="${{ steps.detect.outputs.env_tag }}.$(date +%Y%m%d%H%M)"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          docker tag \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPOSITORY }}:latest \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPOSITORY }}:$TAG
+
+      - name: Push Docker Image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPOSITORY }}:latest
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPOSITORY }}:${{ steps.tag.outputs.tag }}
+
+  trivy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ needs.build.outputs.registry }}/${{ env.APP_REPOSITORY }}:${{ needs.build.outputs.image-tag }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+
+  deploy:
+    needs: [build, trivy]
+    runs-on: ubuntu-latest
+    if: ${{ needs.build.outputs.deploy-ecs == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Environment
+        id: detect
+        shell: bash
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+
+            if [ "$BRANCH" = "uat" ]; then
+            echo "env_tag=uat" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=LLZ-UAT" >> $GITHUB_OUTPUT
+            echo "ecs_service=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "container_name=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_UAT }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ACTIONS_ECR_REGISTRY_UAT }}" >> $GITHUB_OUTPUT
+
+          elif [ "$BRANCH" = "hml" ]; then
+            echo "env_tag=hml" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=LLZ-HML" >> $GITHUB_OUTPUT
+            echo "ecs_service=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "container_name=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_HML }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ACTIONS_ECR_REGISTRY_HML }}" >> $GITHUB_OUTPUT
+
+          elif [ "$BRANCH" = "release" ]; then
+            echo "env_tag=prd" >> $GITHUB_OUTPUT
+            echo "ecs_cluster=LLZ-PRD" >> $GITHUB_OUTPUT
+            echo "ecs_service=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "container_name=${{ env.ECS_SERVICE }}" >> $GITHUB_OUTPUT
+            echo "role_arn=${{ secrets.ACTIONS_ROLE_PRD }}" >> $GITHUB_OUTPUT
+            echo "ecr_registry=${{ secrets.ACTIONS_ECR_REGISTRY_PRD }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.detect.outputs.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Update ECS Service with new image
+        id: update-service
+        run: |
+          set -euo pipefail
+
+          # Obter a task definition atual
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+            --services "${{ steps.detect.outputs.ecs_service }}" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          echo "Current TaskDefinition ARN: $TASK_DEF_ARN"
+
+          # Fetch full task definition JSON
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF_ARN" \
+            --query "taskDefinition" > taskdef.json
+
+          # Guardar a imagem anterior para rollback
+          PREVIOUS_IMAGE=$(jq -r '.containerDefinitions[0].image' taskdef.json)
+          echo "prev_image=$PREVIOUS_IMAGE" >> $GITHUB_OUTPUT
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+          IMAGE="${{ needs.build.outputs.registry }}/${{ env.APP_REPOSITORY }}:${{ needs.build.outputs.image-tag }}"
+          CONTAINER="${{ steps.detect.outputs.container_name }}"
+          SERVICE_NAME="${{ steps.detect.outputs.container_name }}"
+          ENVIRONMENT="${{ steps.detect.outputs.env_tag }}"
+
+          echo "Updating container: $CONTAINER with image: $IMAGE"
+          echo "Previous image: $PREVIOUS_IMAGE"
+
+          jq \
+            --arg IMAGE "$IMAGE" \
+            --arg CONTAINER "$CONTAINER" \
+            --arg SERVICE_NAME "$SERVICE_NAME" \
+            --arg ENVIRONMENT "$ENVIRONMENT" \
+            '
+            .
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .registeredAt,
+                .registeredBy,
+                .deregisteredAt,
+                .compatibilities
+              )
+            | .containerDefinitions |= map(
+                if .name == $CONTAINER then
+                  .image = $IMAGE
+                  | .environment |= map(
+                      if .name | startswith("OTEL_") then
+                        empty
+                      else
+                        .
+                      end
+                    )
+                  | .environment += [
+                      { "name": "OTEL_RESOURCE_ATTRIBUTES", "value": ("service.name=" + $SERVICE_NAME + ",environment=" + $ENVIRONMENT) },
+                      { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://aws-otel-collector:4317" },
+                      { "name": "OTEL_TRACES_SAMPLER", "value": "parentbased_traceidratio" },
+                      { "name": "OTEL_TRACES_SAMPLER_ARG", "value": "0.05" },
+                      { "name": "OTEL_EXPORTER_OTLP_PROTOCOL", "value": "grpc" },
+                      { "name": "OTEL_TRACES_EXPORTER", "value": "otlp" },
+                      { "name": "OTEL_METRICS_EXPORTER", "value": "none" }
+                    ]
+                else .
+                end
+              )
+            ' taskdef.json > new-taskdef.json
+
+          echo "Registering updated task definition..."
+          NEW_TASKDEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-taskdef.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "new_taskdef=$NEW_TASKDEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS
+        if: ${{ steps.detect.outputs.deploy_ecs == 'true' }}
+        run: |
+          aws ecs update-service \
+            --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+            --service "${{ steps.detect.outputs.ecs_service }}" \
+            --task-definition "${{ steps.update-service.outputs.new_taskdef }}" \
+            --force-new-deployment
+
+          echo "Service atualizado com nova imagem"
+
+      - name: Wait for service to become stable
+        id: wait-stable
+        if: ${{ steps.detect.outputs.deploy_ecs == 'true' }}
+        run: |
+          echo "⏳ Aguardando serviço estabilizar (timeout: 20 minutos)..."
+          
+          MAX_WAIT=1200  # 20 minutos em segundos
+          INTERVAL=30    # Verificar a cada 30 segundos
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            echo "Verificando status do serviço... ($ELAPSED/$MAX_WAIT segundos)"
+          
+            # Obter status do serviço
+            SERVICE_STATUS=$(aws ecs describe-services \
+              --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+              --services "${{ steps.detect.outputs.ecs_service }}" \
+              --query 'services[0]' \
+              --output json)
+          
+            RUNNING_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.runningCount')
+            DESIRED_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.desiredCount')
+            PENDING_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.pendingCount')
+            DEPLOYMENT_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.deployments | length')
+            PRIMARY_DEPLOYMENT_STATUS=$(echo "$SERVICE_STATUS" | jq -r '.deployments[] | select(.status == "PRIMARY") | .rolloutState // "IN_PROGRESS"')
+          
+            echo "  Running: $RUNNING_COUNT / Desired: $DESIRED_COUNT / Pending: $PENDING_COUNT"
+            echo "  Deployments ativos: $DEPLOYMENT_COUNT"
+            echo "  Status do deployment primário: $PRIMARY_DEPLOYMENT_STATUS"
+          
+            # Verificar se está estável
+            if [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ] && \
+               [ "$PENDING_COUNT" -eq 0 ] && \
+               [ "$DEPLOYMENT_COUNT" -eq 1 ] && \
+               [ "$PRIMARY_DEPLOYMENT_STATUS" = "COMPLETED" ]; then
+              echo "✅ Serviço estável!"
+              break
+            fi
+          
+            # Verificar se há falhas
+            FAILED_TASKS=$(aws ecs list-tasks \
+              --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+              --service-name "${{ steps.detect.outputs.ecs_service }}" \
+              --desired-status STOPPED \
+              --query 'taskArns[0]' \
+              --output text 2>/dev/null || echo "None")
+          
+            if [ "$FAILED_TASKS" != "None" ] && [ "$FAILED_TASKS" != "" ]; then
+              echo "⚠️ Detectada task parada recentemente, verificando motivo..."
+              STOP_REASON=$(aws ecs describe-tasks \
+                --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+                --tasks "$FAILED_TASKS" \
+                --query 'tasks[0].stoppedReason' \
+                --output text 2>/dev/null || echo "Desconhecido")
+              echo "  Motivo: $STOP_REASON"
+            fi
+          
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "❌ Timeout: Serviço não estabilizou em $MAX_WAIT segundos"
+            echo "Status final: Running=$RUNNING_COUNT, Desired=$DESIRED_COUNT, Pending=$PENDING_COUNT"
+            exit 1
+          fi
+
+      - name: Collect diagnostics on failure
+        if: failure() && steps.wait-stable.outcome == 'failure'
+        run: |
+          echo "🔍 Coletando informações de diagnóstico..."
+          
+          # Listar eventos recentes do serviço
+          echo "=== Eventos recentes do serviço ==="
+          aws ecs describe-services \
+            --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+            --services "${{ steps.detect.outputs.ecs_service }}" \
+            --query 'services[0].events[:10]' \
+            --output table || true
+          
+          # Listar tasks paradas recentemente
+          echo "=== Tasks paradas recentemente ==="
+          STOPPED_TASKS=$(aws ecs list-tasks \
+            --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+            --service-name "${{ steps.detect.outputs.ecs_service }}" \
+            --desired-status STOPPED \
+            --max-results 5 \
+            --query 'taskArns' \
+            --output text || echo "")
+          
+          if [ -n "$STOPPED_TASKS" ]; then
+            aws ecs describe-tasks \
+              --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+              --tasks $STOPPED_TASKS \
+              --query 'tasks[*].[taskArn, lastStatus, stoppedReason, containers[0].reason]' \
+              --output table || true
+          fi
+
+      - name: Rollback on failure
+        if: failure() && steps.update-service.outputs.task_def_arn != ''
+        run: |
+          echo "⚠️ Deploy falhou! Iniciando rollback..."
+          echo "Revertendo para task definition anterior: ${{ steps.update-service.outputs.task_def_arn }}"
+          
+          aws ecs update-service \
+            --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+            --service "${{ steps.detect.outputs.ecs_service }}" \
+            --task-definition "${{ steps.update-service.outputs.task_def_arn }}" \
+            --force-new-deployment
+          
+          echo "Aguardando rollback ficar estável..."
+          aws ecs wait services-stable \
+            --cluster "${{ steps.detect.outputs.ecs_cluster }}" \
+            --services "${{ steps.detect.outputs.ecs_service }}" \
+            --region "${{ env.AWS_REGION }}"
+          
+          echo "✅ Rollback concluído com sucesso!"
+          echo "Imagem anterior restaurada: ${{ steps.update-service.outputs.prev_image }}"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          ROLLBACK_MSG=""
+          if [ -n "${{ steps.update-service.outputs.task_def_arn }}" ]; then
+            ROLLBACK_MSG="✅ Rollback automático executado com sucesso para versão anterior"
+          fi
+          
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "${GITHUB_REF##*/}" \
+            --arg author "${{ github.actor }}" \
+            --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg rollback "$ROLLBACK_MSG" \
+            --arg prev_image "${{ steps.update-service.outputs.prev_image }}" \
+            '
+            {
+              "@type": "MessageCard",
+              "@context": "https://schema.org/extensions",
+              "themeColor": "FF0000",
+              "summary": "Deploy falhou",
+              "sections": [
+                {
+                  "activityTitle": "❌ Deploy falhou",
+                  "activitySubtitle": ("Repositório: " + $repo),
+                  "facts": [
+                    {"name": "Branch", "value": $branch},
+                    {"name": "Autor", "value": $author},
+                    {"name": "Status", "value": (if $rollback != "" then $rollback else "⚠️ Rollback não executado")},
+                    {"name": "Imagem Anterior", "value": (if $prev_image != "" then $prev_image else "N/A")}
+                  ],
+                  "markdown": true
+                }
+              ],
+              "potentialAction": [
+                {
+                  "@type": "OpenUri",
+                  "name": "Ver detalhes no GitHub Actions",
+                  "targets": [
+                    {
+                      "os": "default",
+                      "uri": $run_url
+                    }
+                  ]
+                }
+              ]
+            }
+            ' > message.json
+          
+          curl -H "Content-Type: application/json" \
+               -d @message.json \
+               "$TEAMS_WEBHOOK_BACK"
