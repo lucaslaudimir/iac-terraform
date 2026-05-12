@@ -27,4 +27,7 @@ locals {
   secret_db_write_url_path  = "/${var.environment}${var.secret_database_write_endpoint}"
   secret_db_read_url_path   = "/${var.environment}${var.secret_database_read_endpoint}"
   secret_aes_key            = "/${var.environment}/operation/secret/aes/key"
+
+  # Path pattern para a listener rule do ALB — substitui o placeholder do template CFN
+  actual_path_pattern = replace(var.path_pattern, "{pluralServiceName}", lower(var.service_name))
 }

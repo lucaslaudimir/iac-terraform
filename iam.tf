@@ -169,8 +169,8 @@ data "aws_iam_policy_document" "s3_ecs_uploads" {
       "s3:ListMultipartUploadParts"
     ]
     resources = [
-      "arn:${data.aws_partition.current.partition}:s3:::*",
-      "arn:${data.aws_partition.current.partition}:s3:::${var.s3_bucket_uploads}"
+      "arn:${data.aws_partition.current.partition}:s3:::${var.s3_bucket_uploads}",
+      "arn:${data.aws_partition.current.partition}:s3:::${var.s3_bucket_uploads}/*"
     ]
   }
 }
